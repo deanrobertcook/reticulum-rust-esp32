@@ -337,19 +337,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "embassy_test"
-version = "0.1.0"
-dependencies = [
- "defmt 1.0.1",
- "embedded-graphics",
- "esp-backtrace",
- "esp-bootloader-esp-idf",
- "esp-hal",
- "esp-println",
- "ssd1306",
-]
-
-[[package]]
 name = "embedded-can"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1108,6 +1095,19 @@ name = "rand_core"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
+
+[[package]]
+name = "reticulum-rust-esp32"
+version = "0.1.0"
+dependencies = [
+ "defmt 1.0.1",
+ "embedded-graphics",
+ "esp-backtrace",
+ "esp-bootloader-esp-idf",
+ "esp-hal",
+ "esp-println",
+ "ssd1306",
+]
 
 [[package]]
 name = "riscv"

@@ -15,7 +15,6 @@ use esp_hal::{
     delay::Delay,
     i2c::master::{Config, I2c},
     time::Duration,
-    // xtensa_lx_rt::entry,
 };
 use esp_println as _;
 use ssd1306::{
@@ -27,9 +26,6 @@ use ssd1306::{
 fn main() -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
     let delay = Delay::new();
-
-    // let system = SystemControl::new(peripherals.SYSTEM);
-    // let delay = Delay::new();
 
     esp_println::logger::init_logger_from_env();
 
@@ -59,7 +55,6 @@ fn main() -> ! {
         .unwrap();
 
     display.flush().unwrap();
-    // panic!("Uh oh...");
     defmt::info!("Hello Thea!");
     loop {
         defmt::info!("Hello world!");
