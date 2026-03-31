@@ -15,6 +15,7 @@ esp-println = { version = "0.16.1", features = ["esp32", "log-04", "defmt-espfla
 ssd1306 = "0.10.0"
 embedded-graphics = "0.8.2"
 defmt = "1.0.1"
+critical-section = "1.2"
 
 [features]
 esp32 = [

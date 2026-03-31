@@ -1100,6 +1100,7 @@ checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
 name = "reticulum-rust-esp32"
 version = "0.1.0"
 dependencies = [
+ "critical-section",
  "defmt 1.0.1",
  "embedded-graphics",
  "esp-backtrace",
