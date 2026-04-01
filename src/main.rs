@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![feature(asm_experimental_arch)]
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -7,7 +8,7 @@ use core::{
     cell::RefCell,
     future::Future,
     pin::{Pin, pin},
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
@@ -58,11 +59,20 @@ static WAKER: critical_section::Mutex<RefCell<Option<Waker>>> =
 // sleep. The waker is a no-op because we unconditionally re-poll anyway.
 // ---------------------------------------------------------------------------
 
+// Set by waker.wake() to signal the executor there is work to do.
+// Checked before sleeping so we don't miss a wake that arrived between
+// the future's Pending return and the waiti instruction.
+static WAKE_SIGNAL: AtomicBool = AtomicBool::new(false);
+
 static VTABLE: RawWakerVTable = RawWakerVTable::new(
-    |p| RawWaker::new(p, &VTABLE), // clone  — keep the same data pointer
-    |_| {},                        // wake (consuming)  — nothing to do
-    |_| {},                        // wake_by_ref       — nothing to do
-    |_| {},                        // drop              — nothing to free
+    |p| RawWaker::new(p, &VTABLE), // clone
+    |_| {
+        WAKE_SIGNAL.store(true, Ordering::Release);
+    }, // wake (consuming)
+    |_| {
+        WAKE_SIGNAL.store(true, Ordering::Release);
+    }, // wake_by_ref
+    |_| {},                        // drop — nothing to free
 );
 
 fn block_on<F: Future>(future: F) -> F::Output {
@@ -76,7 +86,29 @@ fn block_on<F: Future>(future: F) -> F::Output {
     loop {
         match future.as_mut().poll(&mut cx) {
             Poll::Ready(val) => return val,
-            Poll::Pending => {} // spin: just try again immediately
+            Poll::Pending => {
+                // Check whether wake() was already called between the future
+                // returning Pending and now. If so, skip sleep and re-poll
+                // immediately — we'd otherwise miss the signal.
+                //
+                // If WAKE_SIGNAL is clear, halt the CPU with `waiti 0`.
+                // On Xtensa this is a single instruction that atomically:
+                //   1. lowers INTLEVEL to 0 (enables all interrupts)
+                //   2. idles until any interrupt fires
+                // The timer ISR will fire, call waker.wake() → set WAKE_SIGNAL,
+                // then return. Execution resumes on the next line.
+                //
+                // Note: there is still a narrow race between the swap and the
+                // waiti instruction. If the ISR fires in that window it will
+                // run normally (interrupts are enabled), set WAKE_SIGNAL, and
+                // return; when we then execute waiti we will wait until the
+                // *next* interrupt. For a 500 ms timer that is acceptable.
+                // Closing this fully requires a disable+waiti sequence in
+                // inline assembly, which we leave for a later step.
+                if !WAKE_SIGNAL.swap(false, Ordering::AcqRel) {
+                    unsafe { core::arch::asm!("waiti 0") };
+                }
+            }
         }
     }
 }
@@ -256,7 +288,7 @@ fn main() -> ! {
     let tg0 = TimerGroup::new(peripherals.TIMG0);
     let mut timer0 = PeriodicTimer::new(tg0.timer0);
     timer0.set_interrupt_handler(tg0_t0_handler);
-    timer0.start(Duration::from_millis(500)).unwrap();
+    timer0.start(Duration::from_millis(3000)).unwrap();
     timer0.listen();
     critical_section::with(|cs| {
         TIMER0.borrow_ref_mut(cs).replace(timer0);
