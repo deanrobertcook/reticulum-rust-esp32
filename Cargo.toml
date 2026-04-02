@@ -16,6 +16,7 @@ ssd1306 = "0.10.0"
 embedded-graphics = "0.8.2"
 defmt = "1.0.1"
 critical-section = "1.2"
+esp-wifi-hal = { git = "https://github.com/esp32-open-mac/esp-wifi-hal", features = ["esp32", "defmt"] }
 
 [features]
 esp32 = [
