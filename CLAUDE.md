@@ -18,6 +18,10 @@ espup install
 . ~/export-esp.sh   # must source this in every new shell
 ```
 
+## Git History
+
+Always run `git log --oneline` (or `git log`) at the start of a session and before beginning any task. Commit messages contain important context about the project's progress, decisions made, and current state — reading them is essential for understanding where things stand.
+
 ## Commands
 
 ```sh
