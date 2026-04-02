@@ -12,185 +12,110 @@ use core::{
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
-use embedded_graphics::{
-    Drawable,
-    mono_font::{MonoTextStyleBuilder, ascii::FONT_6X10},
-    pixelcolor::BinaryColor,
-    prelude::Point,
-    text::{Baseline, Text},
-};
 use esp_backtrace as _;
 use esp_hal::{
     Blocking, handler,
-    i2c::master::{Config, I2c},
-    time::{Duration, Instant},
+    time::Duration,
     timer::{PeriodicTimer, timg::TimerGroup},
 };
 use esp_println as _;
-use ssd1306::{
-    I2CDisplayInterface, Ssd1306, mode::DisplayConfig, prelude::DisplayRotation,
-    size::DisplaySize128x64,
-};
-
-// PeriodicTimer auto-reloads after each interrupt, so the ISR only needs
-// to call clear_interrupt() — no manual reload required.
-type Timer0<'d> = PeriodicTimer<'d, Blocking>;
+use esp_wifi_hal::{TxParameters, WiFi, WiFiRate, WiFiResources};
+use static_cell::StaticCell;
 
 // ---------------------------------------------------------------------------
 // Timer interrupt globals
-//
-// TICKS   — incremented by the ISR each time the hardware timer fires.
-// TIMER0  — the timer peripheral itself; the ISR needs it to clear the
-//           interrupt flag and reload the countdown before the next tick.
-// WAKER   — where a future parks its Waker so the ISR can call wake().
-//           The ISR takes the waker out (Option → None) to avoid waking
-//           twice; the future re-stores it on the next Pending return.
 // ---------------------------------------------------------------------------
+
+type Timer0<'d> = PeriodicTimer<'d, Blocking>;
+
 static TICKS: AtomicU32 = AtomicU32::new(0);
-static TIMER0: critical_section::Mutex<RefCell<Option<Timer0>>> =
-    critical_section::Mutex::new(RefCell::new(None));
-static WAKER: critical_section::Mutex<RefCell<Option<Waker>>> =
+static TIMER0: critical_section::Mutex<RefCell<Option<Timer0<'static>>>> =
     critical_section::Mutex::new(RefCell::new(None));
 
 // ---------------------------------------------------------------------------
-// Executor
+// Round-robin executor
 //
-// A "spin" executor: polls the future in a tight loop. No task queue, no
-// sleep. The waker is a no-op because we unconditionally re-poll anyway.
+// Each task occupies a numbered slot (0..MAX_TASKS). TASK_READY[i] is the
+// "should poll" flag for slot i. When a future returns Pending it does NOT
+// need to store its waker anywhere — the ISR (and the WiFi driver, via the
+// waker we hand it) will flip the flag and the executor will re-poll.
+//
+// The waker data pointer IS the slot index, so the vtable can wake a single
+// specific slot without touching the others.
 // ---------------------------------------------------------------------------
 
-// Set by waker.wake() to signal the executor there is work to do.
-// Checked before sleeping so we don't miss a wake that arrived between
-// the future's Pending return and the waiti instruction.
-static WAKE_SIGNAL: AtomicBool = AtomicBool::new(false);
+const MAX_TASKS: usize = 4;
 
-static VTABLE: RawWakerVTable = RawWakerVTable::new(
-    |p| RawWaker::new(p, &VTABLE), // clone
-    |_| {
-        WAKE_SIGNAL.store(true, Ordering::Release);
-    }, // wake (consuming)
-    |_| {
-        WAKE_SIGNAL.store(true, Ordering::Release);
-    }, // wake_by_ref
-    |_| {},                        // drop — nothing to free
+/// All tasks start ready so they each get at least one initial poll on boot.
+static TASK_READY: [AtomicBool; MAX_TASKS] = [const { AtomicBool::new(true) }; MAX_TASKS];
+
+static TASK_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    |p| RawWaker::new(p, &TASK_VTABLE),                               // clone
+    |p| TASK_READY[p as usize].store(true, Ordering::Release),        // wake (consuming)
+    |p| TASK_READY[p as usize].store(true, Ordering::Release),        // wake_by_ref
+    |_| {},                                                            // drop
 );
 
-fn block_on<F: Future>(future: F) -> F::Output {
-    // Safety: the vtable functions are all no-ops so the null data pointer
-    // is never dereferenced.
-    let waker = unsafe { Waker::new(core::ptr::null(), &VTABLE) };
-    let mut cx = Context::from_waker(&waker);
-    // pin! fixes the future in place on the stack so its address is stable
-    // across polls (futures may contain self-referential pointers).
-    let mut future = pin!(future);
+/// Drive a fixed slice of futures round-robin, sleeping when all are idle.
+///
+/// The waker given to slot `i` sets `TASK_READY[i]`, so any async driver
+/// (WiFi, timers) can wake exactly the task that is waiting for it.
+fn run_tasks(tasks: &mut [Pin<&mut dyn Future<Output = ()>>]) -> ! {
     loop {
-        match future.as_mut().poll(&mut cx) {
-            Poll::Ready(val) => return val,
-            Poll::Pending => {
-                // Check whether wake() was already called between the future
-                // returning Pending and now. If so, skip sleep and re-poll
-                // immediately — we'd otherwise miss the signal.
-                //
-                // If WAKE_SIGNAL is clear, halt the CPU with `waiti 0`.
-                // On Xtensa this is a single instruction that atomically:
-                //   1. lowers INTLEVEL to 0 (enables all interrupts)
-                //   2. idles until any interrupt fires
-                // The timer ISR will fire, call waker.wake() → set WAKE_SIGNAL,
-                // then return. Execution resumes on the next line.
-                //
-                // Note: there is still a narrow race between the swap and the
-                // waiti instruction. If the ISR fires in that window it will
-                // run normally (interrupts are enabled), set WAKE_SIGNAL, and
-                // return; when we then execute waiti we will wait until the
-                // *next* interrupt. For a 500 ms timer that is acceptable.
-                // Closing this fully requires a disable+waiti sequence in
-                // inline assembly, which we leave for a later step.
-                if !WAKE_SIGNAL.swap(false, Ordering::AcqRel) {
-                    unsafe { core::arch::asm!("waiti 0") };
-                }
+        let mut any_polled = false;
+        for (i, task) in tasks.iter_mut().enumerate() {
+            if TASK_READY[i].swap(false, Ordering::AcqRel) {
+                any_polled = true;
+                // Safety: i fits in a pointer; the vtable never dereferences it.
+                let waker = unsafe { Waker::new(i as *const (), &TASK_VTABLE) };
+                let mut cx = Context::from_waker(&waker);
+                let _ = task.as_mut().poll(&mut cx);
             }
         }
+        // If no task was runnable, halt until the next interrupt. This is
+        // Xtensa's atomic sleep-until-interrupt: it lowers INTLEVEL to 0
+        // and idles in a single instruction, so a wake that arrives between
+        // the flag check above and the waiti cannot be lost.
+        if !any_polled {
+            unsafe { core::arch::asm!("waiti 0") };
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Futures
+// Timer ISR
 //
-// Each struct is a hand-written state machine. `poll` advances it one step
-// and returns Ready(val) when done or Pending to be polled again.
+// Fires every TICK_PERIOD ms. Increments TICKS, then wakes ALL task slots.
+// WaitForTick futures simply re-check their deadline on the next poll —
+// no per-task waker storage needed.
 // ---------------------------------------------------------------------------
 
-/// Yields control back to the executor exactly once, then completes.
-/// Demonstrates that a future can return Pending without being "stuck" —
-/// it will be re-polled on the next iteration of block_on's loop.
-struct YieldNow(bool /* already_yielded */);
-
-impl Future for YieldNow {
-    type Output = ();
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if self.0 {
-            Poll::Ready(())
-        } else {
-            self.0 = true;
-            // Tell the executor we want to be polled again.
-            // In the spin executor this is a no-op, but it's the correct
-            // contract: a future that returns Pending MUST arrange for
-            // wake() to be called, otherwise the executor may park the task.
-            cx.waker().wake_by_ref();
-            Poll::Pending
+#[handler]
+fn tg0_t0_handler() {
+    critical_section::with(|cs| {
+        if let Some(t) = TIMER0.borrow_ref_mut(cs).as_mut() {
+            t.clear_interrupt();
         }
+    });
+    TICKS.fetch_add(1, Ordering::Release);
+    for slot in &TASK_READY {
+        slot.store(true, Ordering::Release);
     }
 }
 
-/// Busy-polls until `duration` has elapsed since first poll.
-/// On each Pending return it calls wake_by_ref() to request re-polling.
-struct AsyncDelay {
-    deadline: Option<Instant>,
-    duration: Duration,
-}
+// ---------------------------------------------------------------------------
+// WaitForTick
+//
+// Suspends until `target` timer interrupts have fired. Because the ISR sets
+// all TASK_READY flags on every tick, no waker needs to be stored: the
+// executor will re-poll this future on the tick after it became Pending.
+// ---------------------------------------------------------------------------
 
-impl AsyncDelay {
-    fn new(duration: Duration) -> Self {
-        Self {
-            deadline: None,
-            duration,
-        }
-    }
-}
-
-impl Future for AsyncDelay {
-    type Output = ();
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let now = Instant::now();
-        // Set the deadline on the first poll; keep it on subsequent polls.
-        let d = self.duration.clone();
-        let deadline = self.deadline.get_or_insert(now + d);
-        if now >= *deadline {
-            Poll::Ready(())
-        } else {
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        }
-    }
-}
-
-/// Waits until the global TICKS counter reaches `target`.
-///
-/// On each Pending return it stores its Waker into the WAKER static so
-/// that the timer ISR can call wake() when the next tick fires. This is
-/// the correct contract for a non-spinning future: rather than calling
-/// wake_by_ref() itself (like AsyncDelay does), it delegates that call
-/// to external hardware.
-///
-/// In our spin executor the waker is still a no-op, so this future
-/// effectively busy-waits — but the architecture is now correct. Swap
-/// in a real executor (Embassy) and the CPU would sleep between ticks.
 struct WaitForTick {
     target: u32,
 }
 
 impl WaitForTick {
-    /// Complete after `ticks` timer interrupts have fired.
     fn after(ticks: u32) -> Self {
         Self {
             target: TICKS.load(Ordering::Relaxed).wrapping_add(ticks),
@@ -200,16 +125,7 @@ impl WaitForTick {
 
 impl Future for WaitForTick {
     type Output = ();
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if TICKS.load(Ordering::Acquire) >= self.target {
-            return Poll::Ready(());
-        }
-        // Park the waker so the ISR can wake us on the next tick.
-        critical_section::with(|cs| {
-            *WAKER.borrow_ref_mut(cs) = Some(cx.waker().clone());
-        });
-        // Check again after storing the waker to close the race window:
-        // the ISR might have fired between the first check and the store.
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
         if TICKS.load(Ordering::Acquire) >= self.target {
             Poll::Ready(())
         } else {
@@ -219,56 +135,148 @@ impl Future for WaitForTick {
 }
 
 // ---------------------------------------------------------------------------
-// Timer ISR
-//
-// The handler attribute sets the correct calling convention and interrupt
-// return instruction for Xtensa. The function is placed in IRAM (#[ram])
-// so it runs from fast on-chip RAM rather than slower flash.
+// WiFi helpers
 // ---------------------------------------------------------------------------
 
-#[handler]
-fn tg0_t0_handler() {
-    // 1. Clear the interrupt flag. PeriodicTimer auto-reloads the countdown,
-    //    so there's nothing else to do to make it fire again.
-    critical_section::with(|cs| {
-        if let Some(t) = TIMER0.borrow_ref_mut(cs).as_mut() {
-            t.clear_interrupt();
-        }
-    });
-    defmt::debug!("Tick handler called!");
+const WIFI_CHANNEL: u8 = 1;
 
-    // 2. Count the tick. Release ordering so any future that loads with
-    //    Acquire sees all writes done before this increment.
-    TICKS.fetch_add(1, Ordering::Release);
+/// Locally-administered MAC for device A (sender).
+#[cfg(feature = "sender")]
+const MY_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+#[cfg(feature = "sender")]
+const PEER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
 
-    // 3. Wake the parked future, if any. We take it out of the Option so
-    //    we don't double-wake; the future will re-store it on next Pending.
-    let waker = critical_section::with(|cs| WAKER.borrow_ref_mut(cs).take());
-    if let Some(w) = waker {
-        w.wake();
-    }
+/// Locally-administered MAC for device B (receiver/echo).
+#[cfg(feature = "receiver")]
+const MY_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+#[cfg(feature = "receiver")]
+const PEER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+
+/// Write a minimal 802.11 data frame into `buf` and return the byte count.
+///
+/// Frame layout (24-byte MAC header + payload):
+///   FC(2) | Duration(2) | DA(6) | SA(6) | BSSID(6) | SeqCtrl(2) | payload
+///
+/// SeqCtrl is zeroed here; `override_seq_num: true` in TxParameters tells
+/// the hardware to fill it in correctly before transmission.
+#[cfg(any(feature = "sender", feature = "receiver"))]
+fn build_frame(dst: &[u8; 6], src: &[u8; 6], payload: &[u8], buf: &mut [u8]) -> usize {
+    const HDR: usize = 24;
+    let total = HDR + payload.len();
+    buf[0] = 0x08; buf[1] = 0x00;           // Frame Control: Data
+    buf[2] = 0x00; buf[3] = 0x00;           // Duration/ID
+    buf[4..10].copy_from_slice(dst);         // Address 1 — DA
+    buf[10..16].copy_from_slice(src);        // Address 2 — SA
+    buf[16..22].copy_from_slice(dst);        // Address 3 — BSSID (reuse DA)
+    buf[22] = 0x00; buf[23] = 0x00;         // Sequence Control
+    buf[HDR..total].copy_from_slice(payload);
+    total
 }
 
 // ---------------------------------------------------------------------------
-// Async application logic
+// Tasks
 // ---------------------------------------------------------------------------
 
-async fn run() -> ! {
-    // --- demonstrate YieldNow ---
-    defmt::info!("poll 1: about to yield");
-    YieldNow(false).await; // returns Pending on first poll, Ready on second
-    defmt::info!("poll 2: resumed after yield");
-
-    // --- main loop driven by the hardware timer ISR ---
+/// Heartbeat: logs the running tick count on every timer interrupt.
+/// Runs on both devices to confirm the executor and timer are alive.
+async fn heartbeat_task() {
     let mut count: u32 = 0;
     loop {
         defmt::info!("tick {}", count);
         count += 1;
-        // WaitForTick suspends here; the ISR increments TICKS and calls
-        // wake(), which causes block_on to poll this future again.
         WaitForTick::after(1).await;
     }
 }
+
+/// Sender (device A): every 5 ticks transmit a HELLO frame, then wait for
+/// the echo reply before sleeping again.
+///
+/// Build with: `cargo espflash flash --release --features sender`
+#[cfg(feature = "sender")]
+async fn sender_task(wifi: &WiFi<'_>) {
+    loop {
+        // --- transmit ---
+        let mut frame = [0u8; 256];
+        let len = build_frame(&PEER_MAC, &MY_MAC, b"HELLO", &mut frame);
+        wifi.transmit(
+            &mut frame[..len],
+            &TxParameters {
+                rate: WiFiRate::PhyRate1ML,
+                override_seq_num: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .ok();
+        defmt::info!("TX: HELLO");
+
+        // --- wait for echo reply from peer ---
+        // Discard any frames that didn't come from our peer (e.g. beacons).
+        loop {
+            let reply = wifi.receive().await;
+            let mpdu = reply.mpdu_buffer();
+            // Address 2 (SA) lives at bytes 10-15 of the 802.11 header.
+            let from_peer = mpdu.len() >= 16 && &mpdu[10..16] == &PEER_MAC;
+            if from_peer {
+                let payload = if mpdu.len() > 24 { &mpdu[24..] } else { &[] };
+                defmt::info!("RX echo: {} bytes — {:?}", payload.len(), payload);
+                drop(reply);
+                break;
+            }
+            drop(reply);
+        }
+
+        WaitForTick::after(5).await;
+    }
+}
+
+/// Echo (device B): receive any frame from the peer and send it straight back
+/// with the addresses swapped.
+///
+/// Build with: `cargo espflash flash --release --features receiver`
+#[cfg(feature = "receiver")]
+async fn echo_task(wifi: &WiFi<'_>) {
+    loop {
+        let frame = wifi.receive().await;
+        let mpdu = frame.mpdu_buffer();
+
+        // Filter: only echo frames whose SA (bytes 10-15) is our peer.
+        if mpdu.len() < 16 || &mpdu[10..16] != &PEER_MAC {
+            drop(frame);
+            continue;
+        }
+
+        // Copy the full MPDU out before releasing the borrowed buffer.
+        let mut buf = [0u8; 256];
+        let len = mpdu.len().min(buf.len());
+        buf[..len].copy_from_slice(&mpdu[..len]);
+        drop(frame);
+
+        // Swap DA ↔ SA in the 802.11 header so the frame goes back to sender.
+        buf[4..10].copy_from_slice(&PEER_MAC); // Address 1 — DA (original sender)
+        buf[10..16].copy_from_slice(&MY_MAC);  // Address 2 — SA (us)
+
+        wifi.transmit(
+            &mut buf[..len],
+            &TxParameters {
+                rate: WiFiRate::PhyRate1ML,
+                override_seq_num: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .ok();
+        defmt::info!("Echoed {} bytes", len);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Static storage for WiFi DMA descriptors (must outlive WiFi<'_>).
+// ---------------------------------------------------------------------------
+
+static WIFI_RESOURCES: StaticCell<WiFiResources<10>> = StaticCell::new();
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -277,14 +285,9 @@ async fn run() -> ! {
 #[esp_hal::main]
 fn main() -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
-
     esp_println::logger::init_logger_from_env();
 
-    // --- Set up TIMG0 Timer0 to fire every 500 ms ---
-    //
-    // PeriodicTimer wraps the raw timg timer and exposes the public API.
-    // `start` sets the period and begins counting; `listen` enables the
-    // interrupt line so the ISR fires when the period elapses.
+    // --- Timer: 3 s per tick ---
     let tg0 = TimerGroup::new(peripherals.TIMG0);
     let mut timer0 = PeriodicTimer::new(tg0.timer0);
     timer0.set_interrupt_handler(tg0_t0_handler);
@@ -294,30 +297,24 @@ fn main() -> ! {
         TIMER0.borrow_ref_mut(cs).replace(timer0);
     });
 
-    let i2c = I2c::new(peripherals.I2C0, Config::default())
-        .unwrap()
-        .with_scl(peripherals.GPIO22)
-        .with_sda(peripherals.GPIO21);
+    // --- WiFi ---
+    let wifi = WiFi::new(
+        peripherals.WIFI,
+        peripherals.ADC2,
+        WIFI_RESOURCES.init(WiFiResources::new()),
+    );
+    wifi.set_channel(WIFI_CHANNEL).ok();
 
-    let interface = I2CDisplayInterface::new(i2c);
-    let mut display = Ssd1306::new(interface, DisplaySize128x64, DisplayRotation::Rotate0)
-        .into_buffered_graphics_mode();
-    display.init().unwrap();
+    // --- Spawn tasks (role selected at compile time) ---
+    let mut heartbeat = pin!(heartbeat_task());
 
-    let text_style = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
-        .text_color(BinaryColor::On)
-        .build();
+    #[cfg(feature = "sender")]
+    let mut role = pin!(sender_task(&wifi));
+    #[cfg(feature = "receiver")]
+    let mut role = pin!(echo_task(&wifi));
 
-    Text::with_baseline("Hello world!", Point::zero(), text_style, Baseline::Top)
-        .draw(&mut display)
-        .unwrap();
-    Text::with_baseline("Hello Rust!", Point::new(0, 16), text_style, Baseline::Top)
-        .draw(&mut display)
-        .unwrap();
-    display.flush().unwrap();
+    let mut tasks: [Pin<&mut dyn Future<Output = ()>>; 2] =
+        [heartbeat.as_mut(), role.as_mut()];
 
-    // Hand off to the async world. block_on drives `run()` to completion
-    // (which never happens — run() loops forever — so this also loops forever).
-    block_on(run())
+    run_tasks(&mut tasks)
 }

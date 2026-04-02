@@ -12,16 +12,19 @@ esp-backtrace = { version = "0.18.1", features = [
 	"defmt",
 ] }
 esp-println = { version = "0.16.1", features = ["esp32", "log-04", "defmt-espflash"] }
-ssd1306 = "0.10.0"
-embedded-graphics = "0.8.2"
 defmt = "1.0.1"
 critical-section = "1.2"
 esp-wifi-hal = { git = "https://github.com/esp32-open-mac/esp-wifi-hal", features = ["esp32", "defmt"] }
+static_cell = "2.1.1"
 
 [features]
 esp32 = [
     "esp-hal/esp32",
 ]
+# Flash as sender (device A: transmits HELLO, waits for echo)
+sender = []
+# Flash as receiver (device B: receives any frame and echoes it back)
+receiver = []
 
 [profile.dev]
 # Rust debug is too slow.
