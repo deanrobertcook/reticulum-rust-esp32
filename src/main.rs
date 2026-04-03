@@ -13,6 +13,7 @@ use core::{
 };
 use embedded_graphics::{
     Drawable,
+    draw_target::DrawTarget,
     mono_font::{MonoTextStyleBuilder, ascii::FONT_6X10},
     pixelcolor::BinaryColor,
     prelude::Point,
@@ -28,11 +29,12 @@ use esp_hal::{
 use esp_println as _;
 use esp_wifi_hal::{RxFilterBank, TxParameters, WiFi, WiFiRate, WiFiResources};
 use ssd1306::{
-    I2CDisplayInterface, Ssd1306, mode::DisplayConfig, prelude::DisplayRotation,
-    size::DisplaySize128x64,
+    I2CDisplayInterface, Ssd1306,
+    mode::{BufferedGraphicsMode, DisplayConfig},
+    prelude::{DisplayRotation, WriteOnlyDataCommand},
+    size::{DisplaySize, DisplaySize128x64},
 };
 use static_cell::StaticCell;
-
 // ---------------------------------------------------------------------------
 // Timer interrupt globals
 // ---------------------------------------------------------------------------
@@ -146,6 +148,31 @@ impl Future for WaitForTick {
 }
 
 // ---------------------------------------------------------------------------
+// Shared display state
+//
+// MSG_INDEX is set by the WiFi tasks whenever a message is sent or received.
+// The display task watches it and redraws only when the value changes.
+//
+// Both devices share the same MESSAGES array (compiled into each binary), so
+// a single index byte in the frame payload is enough to keep screens in sync.
+// ---------------------------------------------------------------------------
+
+const MESSAGES: &[&str] = &[
+    "Hello!",
+    "How are you?",
+    "Rust on ESP32",
+    "No OS needed",
+    "WiFi works!",
+    "Open MAC ftw",
+    "Ping!",
+    "Reticulum?",
+];
+
+/// Set by WiFi tasks to tell the display task which message to show.
+/// Initialised to MESSAGES.len() (out of range) so the display draws on boot.
+static MSG_INDEX: AtomicU32 = AtomicU32::new(u32::MAX);
+
+// ---------------------------------------------------------------------------
 // WiFi helpers
 // ---------------------------------------------------------------------------
 
@@ -164,6 +191,7 @@ const MY_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
 const PEER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
 
 /// Write a minimal 802.11 data frame into `buf` and return the byte count.
+/// Payload layout: [msg_index: u8] — one byte is enough to identify the message.
 ///
 /// Frame layout (24-byte MAC header + payload):
 ///   FC(2) | Duration(2) | DA(6) | SA(6) | BSSID(6) | SeqCtrl(2) | payload
@@ -182,7 +210,7 @@ fn build_frame(dst: &[u8; 6], src: &[u8; 6], payload: &[u8], buf: &mut [u8]) -> 
     buf[10..16].copy_from_slice(src); // Address 2 — SA
     buf[16..22].copy_from_slice(dst); // Address 3 — BSSID (reuse DA)
     buf[22] = 0x00;
-    buf[23] = 0x00; // Sequence Control
+    buf[23] = 0x00; // Sequence Control (overridden by HW)
     buf[HDR..total].copy_from_slice(payload);
     total
 }
@@ -198,20 +226,68 @@ async fn heartbeat_task() {
     loop {
         defmt::info!("tick {}", count);
         count += 1;
+        WaitForTick::after(10).await;
+    }
+}
+
+/// Display: redraws the screen whenever MSG_INDEX changes.
+///
+/// Generic over the display hardware so it works with any SSD1306 interface.
+async fn display_task<DI, SIZE>(mut display: Ssd1306<DI, SIZE, BufferedGraphicsMode<SIZE>>)
+where
+    DI: WriteOnlyDataCommand,
+    SIZE: DisplaySize,
+    Ssd1306<DI, SIZE, BufferedGraphicsMode<SIZE>>: DrawTarget<Color = BinaryColor>,
+{
+    #[cfg(feature = "sender")]
+    let mut name = "sender:";
+    #[cfg(feature = "receiver")]
+    let mut name = "receiver:";
+
+    let text_style = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+
+    let mut last_drawn = u32::MAX - 1; // different from initial MSG_INDEX sentinel
+
+    loop {
+        let idx = MSG_INDEX.load(Ordering::Acquire);
+        if idx != last_drawn {
+            last_drawn = idx;
+            let msg = MESSAGES[idx as usize % MESSAGES.len()];
+            display.clear(BinaryColor::Off).ok();
+            Text::with_baseline(name, Point::zero(), text_style, Baseline::Top)
+                .draw(&mut display)
+                .ok();
+            Text::with_baseline(msg, Point::new(0, 16), text_style, Baseline::Top)
+                .draw(&mut display)
+                .ok();
+            display.flush().ok();
+            defmt::info!("Display: {}", msg);
+        }
         WaitForTick::after(1).await;
     }
 }
 
-/// Sender (device A): every 5 ticks transmit a HELLO frame, then wait for
-/// the echo reply before sleeping again.
+/// Sender (device A): cycles through MESSAGES, transmits the index each round,
+/// waits for the echo, then pauses before the next send.
 ///
 /// Build with: `cargo espflash flash --release --features sender`
 #[cfg(feature = "sender")]
 async fn sender_task(wifi: &WiFi<'_>) {
+    let mut counter: u32 = 0;
     loop {
-        // --- transmit ---
+        let idx = (counter as usize) % MESSAGES.len();
+
+        // Update local display immediately so sender sees the message it's about to send.
+        MSG_INDEX.store(idx as u32, Ordering::Release);
+
+        // Payload: single byte carrying the message index.
+        let payload = [idx as u8];
         let mut frame = [0u8; 256];
-        let len = build_frame(&PEER_MAC, &MY_MAC, b"HELLO", &mut frame);
+        let len = build_frame(&PEER_MAC, &MY_MAC, &payload, &mut frame);
+
         wifi.transmit(
             &mut frame[..len],
             &TxParameters {
@@ -223,7 +299,7 @@ async fn sender_task(wifi: &WiFi<'_>) {
         )
         .await
         .ok();
-        defmt::info!("TX: HELLO");
+        defmt::info!("TX idx={} \"{}\"", idx, MESSAGES[idx]);
 
         // --- wait for echo reply from peer ---
         // Discard any frames that didn't come from our peer (e.g. beacons).
@@ -233,46 +309,50 @@ async fn sender_task(wifi: &WiFi<'_>) {
             // Address 2 (SA) lives at bytes 10-15 of the 802.11 header.
             let from_peer = mpdu.len() >= 16 && &mpdu[10..16] == &PEER_MAC;
             if from_peer {
-                let payload = if mpdu.len() > 24 { &mpdu[24..] } else { &[] };
-                defmt::info!("RX echo: {} bytes — {:?}", payload.len(), payload);
+                defmt::info!("RX echo confirmed");
                 drop(reply);
                 break;
             }
             drop(reply);
         }
 
-        WaitForTick::after(5).await;
+        counter = counter.wrapping_add(1);
+        WaitForTick::after(10).await;
     }
 }
 
-/// Echo (device B): receive any frame from the peer and send it straight back
-/// with the addresses swapped.
+/// Echo (device B): receives a frame from the peer, updates the display with
+/// the embedded message index, then echoes the frame back.
 ///
 /// Build with: `cargo espflash flash --release --features receiver`
 #[cfg(feature = "receiver")]
 async fn echo_task(wifi: &WiFi<'_>) {
     loop {
-        defmt::debug!("wifi.receive().await");
         let frame = wifi.receive().await;
-        defmt::debug!("Received a signal!");
         let mpdu = frame.mpdu_buffer();
 
-        // Filter: only echo frames whose SA (bytes 10-15) is our peer.
+        // Filter: only handle frames from our peer.
         if mpdu.len() < 16 || &mpdu[10..16] != &PEER_MAC {
-            defmt::debug!("Wasn't for us");
             drop(frame);
             continue;
         }
 
+        // Read the message index from the first payload byte (after the 24-byte header).
+        if mpdu.len() > 24 {
+            let idx = (mpdu[24] as usize) % MESSAGES.len();
+            MSG_INDEX.store(idx as u32, Ordering::Release);
+            defmt::info!("RX idx={} \"{}\"", idx, MESSAGES[idx]);
+        }
+
         // Copy the full MPDU out before releasing the borrowed buffer.
+        // Then swap DA ↔ SA so the frame goes back to the sender.
         let mut buf = [0u8; 256];
         let len = mpdu.len().min(buf.len());
         buf[..len].copy_from_slice(&mpdu[..len]);
         drop(frame);
 
-        // Swap DA ↔ SA in the 802.11 header so the frame goes back to sender.
-        buf[4..10].copy_from_slice(&PEER_MAC); // Address 1 — DA (original sender)
-        buf[10..16].copy_from_slice(&MY_MAC); // Address 2 — SA (us)
+        buf[4..10].copy_from_slice(&PEER_MAC); // DA = original sender
+        buf[10..16].copy_from_slice(&MY_MAC); // SA = us
 
         wifi.transmit(
             &mut buf[..len],
@@ -304,11 +384,6 @@ fn main() -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
     esp_println::logger::init_logger_from_env();
 
-    #[cfg(feature = "sender")]
-    let text = "sender";
-    #[cfg(feature = "receiver")]
-    let text = "receiver";
-
     // --- Display ---
     let i2c = I2c::new(peripherals.I2C0, Config::default())
         .unwrap()
@@ -320,21 +395,11 @@ fn main() -> ! {
         .into_buffered_graphics_mode();
     display.init().unwrap();
 
-    let text_style = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
-        .text_color(BinaryColor::On)
-        .build();
-
-    Text::with_baseline(text, Point::zero(), text_style, Baseline::Top)
-        .draw(&mut display)
-        .unwrap();
-    display.flush().unwrap();
-
     // --- Timer: 3 s per tick ---
     let tg0 = TimerGroup::new(peripherals.TIMG0);
     let mut timer0 = PeriodicTimer::new(tg0.timer0);
     timer0.set_interrupt_handler(tg0_t0_handler);
-    timer0.start(Duration::from_millis(3000)).unwrap();
+    timer0.start(Duration::from_millis(100)).unwrap();
     timer0.listen();
     critical_section::with(|cs| {
         TIMER0.borrow_ref_mut(cs).replace(timer0);
@@ -347,7 +412,6 @@ fn main() -> ! {
         WIFI_RESOURCES.init(WiFiResources::new()),
     );
     wifi.set_channel(WIFI_CHANNEL).ok();
-
     // Configure RX filters so the MAC hardware actually passes frames to DMA.
     // Without this the filter is in an undefined default state and receive()
     // waits forever — frames are dropped in hardware before reaching the driver.
@@ -362,15 +426,18 @@ fn main() -> ! {
     wifi.set_filter_bssid_check(0, false).ok();
     wifi.clear_rx_queue();
 
-    // --- Spawn tasks (role selected at compile time) ---
+    // --- Spawn tasks ---
+    // Slot 0: heartbeat  Slot 1: WiFi role  Slot 2: display
     let mut heartbeat = pin!(heartbeat_task());
+    let mut disp = pin!(display_task(display));
 
     #[cfg(feature = "sender")]
     let mut role = pin!(sender_task(&wifi));
     #[cfg(feature = "receiver")]
     let mut role = pin!(echo_task(&wifi));
 
-    let mut tasks: [Pin<&mut dyn Future<Output = ()>>; 2] = [heartbeat.as_mut(), role.as_mut()];
+    let mut tasks: [Pin<&mut dyn Future<Output = ()>>; 3] =
+        [heartbeat.as_mut(), role.as_mut(), disp.as_mut()];
 
     run_tasks(&mut tasks)
 }
