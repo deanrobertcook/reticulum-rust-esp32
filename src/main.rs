@@ -19,7 +19,7 @@ use esp_hal::{
     timer::{PeriodicTimer, timg::TimerGroup},
 };
 use esp_println as _;
-use esp_wifi_hal::{TxParameters, WiFi, WiFiRate, WiFiResources};
+use esp_wifi_hal::{RxFilterBank, TxParameters, WiFi, WiFiRate, WiFiResources};
 use static_cell::StaticCell;
 
 // ---------------------------------------------------------------------------
@@ -304,6 +304,18 @@ fn main() -> ! {
         WIFI_RESOURCES.init(WiFiResources::new()),
     );
     wifi.set_channel(WIFI_CHANNEL).ok();
+
+    // Configure RX filters so the MAC hardware actually passes frames to DMA.
+    // Without this the filter is in an undefined default state and receive()
+    // waits forever — frames are dropped in hardware before reaching the driver.
+    //
+    // We register our MAC as the expected Receiver Address on interface 0,
+    // disable the BSSID check (we're not in an infrastructure BSS), then
+    // flush any stale frames left over from the channel-change reinit.
+    wifi.set_filter(RxFilterBank::ReceiverAddress, 0, MY_MAC, [0xff; 6]).ok();
+    wifi.set_filter_status(RxFilterBank::ReceiverAddress, 0, true).ok();
+    wifi.set_filter_bssid_check(0, false).ok();
+    wifi.clear_rx_queue();
 
     // --- Spawn tasks (role selected at compile time) ---
     let mut heartbeat = pin!(heartbeat_task());
