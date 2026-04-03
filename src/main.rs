@@ -11,15 +11,26 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
-
+use embedded_graphics::{
+    Drawable,
+    mono_font::{MonoTextStyleBuilder, ascii::FONT_6X10},
+    pixelcolor::BinaryColor,
+    prelude::Point,
+    text::{Baseline, Text},
+};
 use esp_backtrace as _;
 use esp_hal::{
     Blocking, handler,
+    i2c::master::{Config, I2c},
     time::Duration,
     timer::{PeriodicTimer, timg::TimerGroup},
 };
 use esp_println as _;
 use esp_wifi_hal::{RxFilterBank, TxParameters, WiFi, WiFiRate, WiFiResources};
+use ssd1306::{
+    I2CDisplayInterface, Ssd1306, mode::DisplayConfig, prelude::DisplayRotation,
+    size::DisplaySize128x64,
+};
 use static_cell::StaticCell;
 
 // ---------------------------------------------------------------------------
@@ -50,10 +61,10 @@ const MAX_TASKS: usize = 4;
 static TASK_READY: [AtomicBool; MAX_TASKS] = [const { AtomicBool::new(true) }; MAX_TASKS];
 
 static TASK_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    |p| RawWaker::new(p, &TASK_VTABLE),                               // clone
-    |p| TASK_READY[p as usize].store(true, Ordering::Release),        // wake (consuming)
-    |p| TASK_READY[p as usize].store(true, Ordering::Release),        // wake_by_ref
-    |_| {},                                                            // drop
+    |p| RawWaker::new(p, &TASK_VTABLE),                        // clone
+    |p| TASK_READY[p as usize].store(true, Ordering::Release), // wake (consuming)
+    |p| TASK_READY[p as usize].store(true, Ordering::Release), // wake_by_ref
+    |_| {},                                                    // drop
 );
 
 /// Drive a fixed slice of futures round-robin, sleeping when all are idle.
@@ -163,12 +174,15 @@ const PEER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
 fn build_frame(dst: &[u8; 6], src: &[u8; 6], payload: &[u8], buf: &mut [u8]) -> usize {
     const HDR: usize = 24;
     let total = HDR + payload.len();
-    buf[0] = 0x08; buf[1] = 0x00;           // Frame Control: Data
-    buf[2] = 0x00; buf[3] = 0x00;           // Duration/ID
-    buf[4..10].copy_from_slice(dst);         // Address 1 — DA
-    buf[10..16].copy_from_slice(src);        // Address 2 — SA
-    buf[16..22].copy_from_slice(dst);        // Address 3 — BSSID (reuse DA)
-    buf[22] = 0x00; buf[23] = 0x00;         // Sequence Control
+    buf[0] = 0x08;
+    buf[1] = 0x00; // Frame Control: Data
+    buf[2] = 0x00;
+    buf[3] = 0x00; // Duration/ID
+    buf[4..10].copy_from_slice(dst); // Address 1 — DA
+    buf[10..16].copy_from_slice(src); // Address 2 — SA
+    buf[16..22].copy_from_slice(dst); // Address 3 — BSSID (reuse DA)
+    buf[22] = 0x00;
+    buf[23] = 0x00; // Sequence Control
     buf[HDR..total].copy_from_slice(payload);
     total
 }
@@ -238,11 +252,14 @@ async fn sender_task(wifi: &WiFi<'_>) {
 #[cfg(feature = "receiver")]
 async fn echo_task(wifi: &WiFi<'_>) {
     loop {
+        defmt::debug!("wifi.receive().await");
         let frame = wifi.receive().await;
+        defmt::debug!("Received a signal!");
         let mpdu = frame.mpdu_buffer();
 
         // Filter: only echo frames whose SA (bytes 10-15) is our peer.
         if mpdu.len() < 16 || &mpdu[10..16] != &PEER_MAC {
+            defmt::debug!("Wasn't for us");
             drop(frame);
             continue;
         }
@@ -255,7 +272,7 @@ async fn echo_task(wifi: &WiFi<'_>) {
 
         // Swap DA ↔ SA in the 802.11 header so the frame goes back to sender.
         buf[4..10].copy_from_slice(&PEER_MAC); // Address 1 — DA (original sender)
-        buf[10..16].copy_from_slice(&MY_MAC);  // Address 2 — SA (us)
+        buf[10..16].copy_from_slice(&MY_MAC); // Address 2 — SA (us)
 
         wifi.transmit(
             &mut buf[..len],
@@ -287,6 +304,32 @@ fn main() -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
     esp_println::logger::init_logger_from_env();
 
+    #[cfg(feature = "sender")]
+    let text = "sender";
+    #[cfg(feature = "receiver")]
+    let text = "receiver";
+
+    // --- Display ---
+    let i2c = I2c::new(peripherals.I2C0, Config::default())
+        .unwrap()
+        .with_scl(peripherals.GPIO22)
+        .with_sda(peripherals.GPIO21);
+
+    let interface = I2CDisplayInterface::new(i2c);
+    let mut display = Ssd1306::new(interface, DisplaySize128x64, DisplayRotation::Rotate0)
+        .into_buffered_graphics_mode();
+    display.init().unwrap();
+
+    let text_style = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+
+    Text::with_baseline(text, Point::zero(), text_style, Baseline::Top)
+        .draw(&mut display)
+        .unwrap();
+    display.flush().unwrap();
+
     // --- Timer: 3 s per tick ---
     let tg0 = TimerGroup::new(peripherals.TIMG0);
     let mut timer0 = PeriodicTimer::new(tg0.timer0);
@@ -312,8 +355,10 @@ fn main() -> ! {
     // We register our MAC as the expected Receiver Address on interface 0,
     // disable the BSSID check (we're not in an infrastructure BSS), then
     // flush any stale frames left over from the channel-change reinit.
-    wifi.set_filter(RxFilterBank::ReceiverAddress, 0, MY_MAC, [0xff; 6]).ok();
-    wifi.set_filter_status(RxFilterBank::ReceiverAddress, 0, true).ok();
+    wifi.set_filter(RxFilterBank::ReceiverAddress, 0, MY_MAC, [0xff; 6])
+        .ok();
+    wifi.set_filter_status(RxFilterBank::ReceiverAddress, 0, true)
+        .ok();
     wifi.set_filter_bssid_check(0, false).ok();
     wifi.clear_rx_queue();
 
@@ -325,8 +370,7 @@ fn main() -> ! {
     #[cfg(feature = "receiver")]
     let mut role = pin!(echo_task(&wifi));
 
-    let mut tasks: [Pin<&mut dyn Future<Output = ()>>; 2] =
-        [heartbeat.as_mut(), role.as_mut()];
+    let mut tasks: [Pin<&mut dyn Future<Output = ()>>; 2] = [heartbeat.as_mut(), role.as_mut()];
 
     run_tasks(&mut tasks)
 }
